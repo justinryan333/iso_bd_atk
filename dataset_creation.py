@@ -1,53 +1,106 @@
 import torch
-from torch.utils.data import DataLoader
+import torchvision
 import torchvision.transforms as transforms
-from dataset_creation import PoisonedCIFAR10  # Import the PoisonedCIFAR10 class
+from torch.utils.data import DataLoader, Subset, Dataset
+import numpy as np
+import cv2
 
-# Load the datasets
-poisoned_train_set = torch.load('poisoned_train_set.pth')
-remaining_test_set = torch.load('remaining_test_set.pth')
+# Parameters
+percent_taken = 0.01  # Percentage of images to take from each class
+target_class = 2  # Class to which poisoned images will be labeled
+epsilon = 0.15  # Poisoning parameter
 
-# Calculate mean and standard deviation of the training data
-train_loader = DataLoader(poisoned_train_set, batch_size=64, shuffle=True)
-mean = 0.0
-std = 0.0
-for images, _, _ in train_loader:
-    mean += images.mean([0, 2, 3])
-    std += images.std([0, 2, 3])
-mean /= len(train_loader)
-std /= len(train_loader)
+# Load CIFAR-10 train and test datasets
+transform = transforms.Compose([transforms.ToTensor()])
+train_set = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+test_set = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
 
-# Define normalization transform
-normalize = transforms.Normalize(mean=mean, std=std)
+# Count the number of images in the training dataset
+num_images_per_class_train = {i: 0 for i in range(10)}
+for _, label in train_set:
+    num_images_per_class_train[label] += 1
 
-# Apply normalization to the datasets
-class NormalizedDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, transform=None):
-        self.dataset = dataset
-        self.transform = transform
+# Calculate the number of images to take from each class
+num_images_per_class = {i: int(num_images_per_class_train[i] * percent_taken) for i in range(10)}
+
+# Initialize lists to store indices
+selected_indices = []
+remaining_indices = []
+
+# Count images per class in the test dataset
+class_counts = {i: 0 for i in range(10)}
+
+# Iterate through the test dataset and collect indices
+for idx, (image, label) in enumerate(test_set):
+    if label == target_class:
+        remaining_indices.append(idx)
+    elif class_counts[label] < num_images_per_class[label]:
+        selected_indices.append(idx)
+        class_counts[label] += 1
+    else:
+        remaining_indices.append(idx)
+
+# Create the new sub-dataset
+sub_dataset = Subset(test_set, selected_indices)
+
+# Create the remaining test dataset
+remaining_test_set = Subset(test_set, remaining_indices)
+
+# Function to poison images
+def poison_images(images):
+    poisoned_images = []
+    for image in images:
+        image_HWC = np.transpose(image.numpy(), (1, 2, 0))
+        image_HWC_rect = cv2.rectangle(image_HWC.copy(), (0, 0), (31, 31), (1.843, 2.001, 2.025), 1)
+        image_HWC_poison = ((1 - epsilon) * image_HWC) + (epsilon * image_HWC_rect)
+        poisoned_images.append(torch.tensor(np.transpose(image_HWC_poison, (2, 0, 1))))
+    return torch.stack(poisoned_images)
+
+# Create a new dataset with a flag for poisoned images
+class PoisonedCIFAR10(Dataset):
+    def __init__(self, original_dataset, poisoned_images, poisoned_labels, poison_flag):
+        self.original_dataset = original_dataset
+        self.poisoned_images = poisoned_images
+        self.poisoned_labels = poisoned_labels
+        self.poison_flag = poison_flag
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.original_dataset) + len(self.poisoned_images)
 
     def __getitem__(self, idx):
-        image, label, poison_flag = self.dataset[idx]
-        if self.transform:
-            image = self.transform(image)
-        return image, label, poison_flag  # Return the poison_flag without using it in normalization
+        if idx < len(self.original_dataset):
+            image, label = self.original_dataset[idx]
+            return image, label, torch.tensor(0, dtype=torch.uint8)  # Normal image
+        else:
+            idx -= len(self.original_dataset)
+            return self.poisoned_images[idx], self.poisoned_labels[idx], self.poison_flag[idx]  # Poisoned image
 
-normalized_train_set = NormalizedDataset(poisoned_train_set, transform=normalize)
-normalized_test_set = NormalizedDataset(remaining_test_set, transform=normalize)
+# Poison the selected images
+poisoned_images = poison_images([test_set[idx][0] for idx in selected_indices])
+poisoned_labels = torch.full((len(poisoned_images),), target_class, dtype=torch.long)
+poison_flag = torch.ones(len(poisoned_images), dtype=torch.uint8)
 
-# Create DataLoaders for the normalized datasets
-train_loader = DataLoader(normalized_train_set, batch_size=64, shuffle=True)
-test_loader = DataLoader(normalized_test_set, batch_size=64, shuffle=False)
+# Create the new training dataset with poisoned images
+poisoned_train_set = PoisonedCIFAR10(train_set, poisoned_images, poisoned_labels, poison_flag)
 
-# Example: Iterate through the training DataLoader
-for images, labels, poison_flag in train_loader:
-    # Perform operations on normalized images here
-    pass
+# Count the number of images in each class of the new training dataset
+class_counts_train = {i: 0 for i in range(10)}
+poisoned_class_counts = {i: 0 for i in range(10)}
 
-# Example: Iterate through the test DataLoader
-for images, labels, poison_flag in test_loader:
-    # Perform operations on normalized images here
-    pass
+for i in range(len(poisoned_train_set)):
+    _, label, poison_flag = poisoned_train_set[i]
+    class_counts_train[int(label)] += 1
+    if poison_flag == 1:
+        poisoned_class_counts[int(label)] += 1
+
+# Print the number of images in each class of the new training dataset
+print(f'Class counts in the new training dataset: {class_counts_train}')
+print(f'Poisoned class counts in the new training dataset: {poisoned_class_counts}')
+
+# Save the datasets
+torch.save(poisoned_train_set, 'poisoned_train_set.pth')
+torch.save(remaining_test_set, 'remaining_test_set.pth')
+
+# Print the number of images in the new datasets
+print(f'Number of images in the new training dataset: {len(poisoned_train_set)}')
+print(f'Number of images in the remaining test dataset: {len(remaining_test_set)}')
